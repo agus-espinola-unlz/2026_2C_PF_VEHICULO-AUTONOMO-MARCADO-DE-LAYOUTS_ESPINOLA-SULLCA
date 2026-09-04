@@ -1,0 +1,23 @@
+import requests
+from datetime import datetime
+
+CAMERA_IP = "192.168.1.91"
+
+url = f"http://{CAMERA_IP}/capture"
+
+print("Solicitando imagen a la ESP32-CAM...")
+
+response = requests.get(url, timeout=10)
+
+if response.status_code == 200:
+
+    nombre = datetime.now().strftime("captura_%Y%m%d_%H%M%S.jpg")
+
+    with open(nombre, "wb") as archivo:
+        archivo.write(response.content)
+
+    print(f"Imagen guardada correctamente: {nombre}")
+
+else:
+    print("Error al obtener la imagen")
+    print("Código HTTP:", response.status_code)

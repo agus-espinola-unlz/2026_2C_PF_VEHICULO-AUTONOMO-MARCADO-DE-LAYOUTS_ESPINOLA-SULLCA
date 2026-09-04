@@ -1,0 +1,44 @@
+import cv2
+import requests
+import numpy as np
+import time
+
+CAMERA_IP = "192.168.1.91"
+URL = f"http://{CAMERA_IP}/capture"
+
+print("Iniciando cámara...")
+print(f"ESP32-CAM: {CAMERA_IP}")
+
+while True:
+
+    try:
+        # Solicitar captura
+        response = requests.get(URL, timeout=5)
+
+        if response.status_code == 200:
+
+            # Convertir JPEG recibido a array
+            datos = np.frombuffer(response.content, dtype=np.uint8)
+
+            # Decodificar imagen
+            imagen = cv2.imdecode(datos, cv2.IMREAD_COLOR)
+
+            if imagen is not None:
+
+                # Mostrar imagen
+                cv2.imshow("Control de Calidad - ESP32-CAM", imagen)
+
+        else:
+            print("Error HTTP:", response.status_code)
+
+    except requests.exceptions.RequestException as e:
+        print("Error de conexión:", e)
+
+    # ESC para salir
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+    # Pequeña pausa
+    time.sleep(0.05)
+
+cv2.destroyAllWindows()
