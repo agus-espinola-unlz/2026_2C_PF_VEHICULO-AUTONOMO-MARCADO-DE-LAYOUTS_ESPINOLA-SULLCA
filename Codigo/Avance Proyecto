@@ -1,0 +1,739 @@
+import customtkinter as ctk
+import os
+import threading
+import time
+import serial
+import ezdxf
+import matplotlib.pyplot as plt
+import cv2
+import numpy as np
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinter import filedialog
+from PIL import Image, ImageTk
+from pupil_apriltags import Detector
+
+# ==========================================
+# CONEXIÓN SERIAL ESP32
+# ==========================================
+
+try:
+
+    ser = serial.Serial('COM5',115200,timeout=0.1) #Inicio comunicación Serial y vacio el buffer
+
+    time.sleep(2)
+
+    ser.reset_input_buffer()
+
+    print("ESP32 conectada por Serial")
+
+except Exception as e:
+
+    ser = None
+
+    print("No se pudo conectar con ESP32")
+
+    print(e)
+
+# ==========================================
+# CLASE PRINCIPAL
+# ==========================================
+
+class InterfazCADCompleta(ctk.CTk):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.title("Interfaz de Control")
+
+        self.geometry("1280x720")
+
+        ctk.set_appearance_mode("dark")
+
+        # ======================================
+        # GRID
+        # ======================================
+
+        self.grid_columnconfigure(1, weight=1)
+
+        self.grid_columnconfigure(2, weight=3)
+
+        self.grid_rowconfigure(0, weight=1)
+
+        # ======================================
+        # VARIABLES
+        # ======================================
+
+        self.ruta_cad = ""
+
+        self.coordenadas = []
+
+        # ======================================
+        # APRILTAG
+        # ======================================
+
+        self.camera_running = False
+
+        self.cap = None
+
+        self.detector = Detector(families='tag36h11')
+
+        self.tag_x = 0
+
+        self.tag_y = 0
+
+        self.tag_z = 0
+
+        self.inspeccion_activa = False #NUEVO
+
+        self.robot_path_x = [] #vector donde se guardan posiciones
+
+        self.robot_path_y = [] #vector donde se guardan posiciones
+
+        self.camera_params = (1050.0,1050.0,640.0,360.0)
+
+        self.TAG_SIZE = 0.173
+
+        # ======================================
+        # MATRIZ CAMARA
+        # ======================================
+
+        self.camera_matrix = np.array([[1050.0,0,640.0],[0,1050.0,360.0],[0,0,1]],dtype=np.float32)
+
+        self.dist_coeffs = np.array([0.1, -0.05, 0, 0, 0],dtype=np.float32)
+
+        # =====================================================
+        # CUADRADO ZONA DE TRABAJO
+        # =====================================================
+        
+        START_X = 0
+        START_Y = 0
+        SIZE = 1.0
+        
+        self.puntos_cuadrado_3d = np.array([[START_X, -START_Y, 0],[START_X + SIZE, -START_Y, 0],[START_X + SIZE, -START_Y - SIZE, 0],[START_X, -START_Y - SIZE, 0]], dtype=np.float32)
+
+        # ======================================
+        # MENU LATERAL
+        # ======================================
+
+        self.menu_lateral = ctk.CTkFrame(self,width=200,corner_radius=0)
+
+        self.menu_lateral.grid(row=0,column=0,sticky="nsew")
+
+        self.lbl_titulo = ctk.CTkLabel(self.menu_lateral,text="ROBOT NAV",font=("Arial",20,"bold"))
+
+        self.lbl_titulo.pack(pady=20,padx=10)
+
+        # ======================================
+        # BOTONES
+        # ======================================
+
+        self.btn_cad = ctk.CTkButton(self.menu_lateral,text="Cargar CAD (DXF)",fg_color="cyan",text_color="black",command=self.procesar_cad)
+
+        self.btn_cad.pack(pady=20,padx=20)
+
+        self.btn_marcha = ctk.CTkButton(self.menu_lateral,text="Iniciar Trayectoria",fg_color="cyan",text_color="black",command=self.iniciar_trayectoria)
+
+        self.btn_marcha.pack(pady=20,padx=20)
+
+        self.btn_camera = ctk.CTkButton(self.menu_lateral,text="Abrir Cámara",fg_color="green",command=self.toggle_camera)
+
+        self.btn_camera.pack(pady=10,padx=20)
+
+        self.btn_emergencia = ctk.CTkButton(self.menu_lateral,text="PARADA DE EMERGENCIA",fg_color="red",hover_color="#8B0000")
+
+        self.btn_emergencia.pack(pady=20,padx=20)
+
+        # ======================================
+        # FRAME INFO
+        # ======================================
+
+        self.frame_info = ctk.CTkFrame(self,fg_color="transparent")
+
+        self.frame_info.grid(row=0,column=1,padx=20,pady=20,sticky="nsew")
+
+        self.lbl_bienvenida = ctk.CTkLabel(self.frame_info,text="Gestión de Archivos",font=("Arial",24))
+
+        self.lbl_bienvenida.pack(pady=10)
+
+        self.lbl_archivo = ctk.CTkLabel(self.frame_info,text="Archivo: Ninguno",font=("Arial",14),text_color="gray")
+
+        self.lbl_archivo.pack(pady=10)
+
+        self.lbl_estado = ctk.CTkLabel(self.frame_info,text="Estado: Sistema Listo",font=("Arial",16),text_color="green")
+
+        self.lbl_estado.pack(pady=10)
+
+        self.txt_log = ctk.CTkTextbox(self.frame_info,width=250,height=250)
+
+        self.txt_log.pack(pady=20)
+
+        self.txt_log.insert("0.0","Esperando archivo DXF...\n")
+
+        self.lbl_puntos = ctk.CTkLabel(self.frame_info,text="Puntos extraídos: 0",font=("Arial",12))
+
+        self.lbl_puntos.pack(pady=10)
+
+        self.lbl_escala = ctk.CTkLabel(self.frame_info,text="Escala CAD",font=("Arial",12))
+
+        self.lbl_escala.pack(pady=(10,0))
+
+        self.entry_escala = ctk.CTkEntry(self.frame_info,placeholder_text="Ej: 10")
+
+        self.entry_escala.insert(0,"1")
+
+        self.entry_escala.pack(pady=5)
+
+        # ======================================
+        # FRAME PREVIEW
+        # ======================================
+
+        self.frame_preview = ctk.CTkFrame(self)
+
+        self.frame_preview.grid(row=0,column=2,padx=20,pady=20,sticky="nsew")
+
+        self.lbl_preview = ctk.CTkLabel(self.frame_preview,text="Vista Previa",font=("Arial",18))
+
+        self.lbl_preview.pack(pady=10)
+
+        # ======================================
+        # FIGURA
+        # ======================================
+
+        self.fig, self.ax = plt.subplots(figsize=(6,5))
+
+        self.fig.patch.set_facecolor('#2B2B2B')
+
+        self.ax.set_facecolor('#2B2B2B')
+
+        self.ax.tick_params(colors='white')
+
+        self.ax.spines['bottom'].set_color('white')
+
+        self.ax.spines['left'].set_color('white')
+
+        self.canvas = FigureCanvasTkAgg(self.fig,master=self.frame_preview)
+
+        self.canvas.get_tk_widget().pack(fill="both",expand=True,padx=10,pady=10)
+
+        # ======================================
+        # VIDEO
+        # ======================================
+
+        self.video_label = ctk.CTkLabel(self.frame_preview,text="")
+
+        self.video_label.pack(pady=10)
+
+        # ======================================
+        # COORDS
+        # ======================================
+
+        self.lbl_coords = ctk.CTkLabel(self.frame_preview,text="X:0 Y:0 Z:0",font=("Arial",16))
+
+        self.lbl_coords.pack(pady=10)
+
+    # ==========================================
+    # CAMERA
+    # ==========================================
+
+    def toggle_camera(self):
+
+        if not self.camera_running:
+
+            self.camera_running = True
+
+            self.btn_camera.configure(text="Cerrar Cámara",fg_color="red")
+
+            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+            threading.Thread(target=self.update_camera,daemon=True).start()
+
+        else:
+
+            self.camera_running = False
+
+            self.btn_camera.configure(text="Abrir Cámara",fg_color="green")
+
+            if self.cap:
+                self.cap.release()
+
+    # ==========================================
+    # UPDATE CAMERA
+    # ==========================================
+
+    def update_camera(self):
+
+        while self.camera_running:
+
+            ret, frame = self.cap.read()
+    
+            if not ret:
+                continue
+    
+            gray = cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY)
+    
+            results = self.detector.detect(gray,estimate_tag_pose=True,camera_params=self.camera_params,tag_size=self.TAG_SIZE)
+    
+            home = next((r for r in results if r.tag_id == 0),None)
+    
+            tag1 = next((r for r in results if r.tag_id == 1),None)
+
+            # =====================================
+            # INSPECCIÓN CÁMARA
+            # =====================================
+            if self.inspeccion_activa:
+
+                self.inspeccionar_linea(frame)
+            # =====================================
+            # TAG1 RESPECTO TAG0
+            # =====================================
+    
+            if home and tag1: #pose_t es la posición del tag respecto a la cámara
+    
+                R0 = home.pose_R
+                R1 = tag1.pose_R
+                
+                T0 = home.pose_t
+                T1 = tag1.pose_t
+                
+                # ==================================
+                # POSICION DE TAG1 EN SISTEMA TAG0
+                # ==================================
+                
+                T_rel = R0.T @ (T1 - T0) #Calculo posición del robot respecto al tag0
+                R_rel = R0.T @ R1 #Calculo rotación del robot respecto al tag0
+                
+                dx = float(T_rel[0,0]) #Posición del roboy respecto al tag0, es lo mismo que self.robot_x
+                dy = -float(T_rel[1,0])
+                dz = float(T_rel[2,0])
+    
+                # =================================
+                # POSICIÓN DE TAGS
+                # =================================
+    
+                self.robot_x = dx * 1000 # Es la distancia que mide la cámara entre TAGS
+    
+                self.robot_y = dy * 1000
+        
+                self.robot_yaw = np.degrees(np.arctan2(R_rel[1,0],R_rel[0,0])) #CALCULO ÁNGULO DE ORIENTACIÓN
+    
+                # =================================
+                # TEXTO muestra la posición en el recuadro de la cámara
+                # =================================
+    
+                cv2.putText(frame,f"X:{self.robot_x:.2f}mm",(30,200),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+    
+                cv2.putText(frame,f"Y:{self.robot_y:.2f}mm",(30,240),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+    
+                cv2.putText(frame,f"YAW:{self.robot_yaw:.1f}",(30,280),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,255,255),2)
+    
+                # =================================
+                # DIBUJAR TAGS
+                # =================================
+    
+                for tag,color in [(home,(255,0,0)),(tag1,(0,255,0))]:
+    
+                    corners = tag.corners.astype(int)
+    
+                    cv2.polylines(frame,[corners],True,color,2)
+    
+                    centro = tuple(tag.center.astype(int))
+    
+                    cv2.circle(frame,centro,5,(0,0,255),-1)
+    
+                    # =============================
+                    # EJES XYZ
+                    # =============================
+    
+                    axis_length = 0.1
+    
+                    opoints = np.float32([
+                        [0,0,0],
+                        [axis_length,0,0],
+                        [0,axis_length,0],
+                        [0,0,-axis_length]])
+    
+                    rvec,_ = cv2.Rodrigues(tag.pose_R)
+    
+                    tvec = tag.pose_t
+    
+                    imgpts,_ = cv2.projectPoints(opoints,rvec,tvec,self.camera_matrix,self.dist_coeffs)
+    
+                    imgpts = imgpts.astype(int)
+    
+                    origin = tuple(imgpts[0].ravel())
+    
+                    x_axis = tuple(imgpts[1].ravel())
+    
+                    y_axis = tuple(imgpts[2].ravel())
+    
+                    z_axis = tuple(imgpts[3].ravel())
+    
+                    # X rojo
+                    cv2.line(frame,origin,x_axis,(0,0,255),3)
+    
+                    # Y verde
+                    cv2.line(frame,origin,y_axis,(0,255,0),3)
+    
+                    # Z azul
+                    cv2.line(frame,origin,z_axis,(255,0,0),3)
+    
+                # =================================
+                # LABEL muestra posición en interfaz
+                # =================================
+    
+                self.lbl_coords.configure(text=f"X:{self.robot_x:.2f}  Y:{self.robot_y:.2f}  YAW:{self.robot_yaw:.1f}")
+    
+                # =================================
+                # GUARDAR PATH
+                # =================================
+    
+                self.robot_path_x.append(self.robot_x) #guardo la posición
+    
+                self.robot_path_y.append(self.robot_y) #guardo la posición
+    
+                if len(self.robot_path_x) > 500: #funciona como ventana movil, va borrando posiciones viejas
+    
+                    self.robot_path_x.pop(0)
+    
+                    self.robot_path_y.pop(0)
+    
+                # =================================
+                # ACTUALIZAR CAD
+                # =================================
+    
+                self.ax.clear()
+    
+                # CAD ORIGINAL
+                for tray in self.coordenadas:
+    
+                    x_values = [tray[0],tray[2]]
+    
+                    y_values = [tray[1],tray[3]]
+    
+                    self.ax.plot(x_values,y_values,color='cyan') #Dibuja el plano
+    
+                # PATH ROBOT. 
+                self.ax.plot(self.robot_path_x,self.robot_path_y,color='red') #Dibuja la trayectoria
+                   
+                # Posición actual del robot
+                self.ax.scatter(self.robot_x,self.robot_y,s=150,marker='o',color='blue') #Dibuja un punto en la pos actual
+                
+                # Etiqueta
+                self.ax.text(self.robot_x,self.robot_y,"AGV",fontsize=10)
+                
+                self.ax.set_xlabel("X (m)")
+                self.ax.set_ylabel("Y (m)")
+                self.ax.grid(True)
+                self.ax.set_aspect('equal')
+                angulo = np.radians(self.robot_yaw)
+
+                largo = 0.1
+                
+                self.ax.arrow(dx,dy,largo*np.cos(angulo),largo*np.sin(angulo),head_width=0.05)
+                
+                self.canvas.draw()
+                
+    
+            # =====================================
+            # FRAME TK
+            # =====================================
+    
+            frame_rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
+    
+            img = Image.fromarray(frame_rgb)
+    
+            img = img.resize((800,600))
+    
+            imgtk = ImageTk.PhotoImage(image=img)
+    
+            self.video_label.imgtk = imgtk
+    
+            self.video_label.configure(image=imgtk)
+    
+            time.sleep(0.03)
+
+
+    # ==========================================
+    # PREVIEW
+    # ==========================================
+
+    def actualizar_vista_previa(self):
+
+        self.ax.clear()
+
+        for tray in self.coordenadas:
+
+            x_values = [tray[0],tray[2]]
+            y_values = [tray[1],tray[3]]
+
+            self.ax.plot(x_values,y_values,color='cyan')
+
+        self.ax.set_aspect('equal')
+
+        self.ax.grid(True)
+
+        self.canvas.draw()
+
+    # ==========================================
+    # SERIAL
+    # ==========================================
+
+    def iniciar_trayectoria(self):
+
+        try:
+
+            factor = float(self.entry_escala.get())
+
+        except:
+
+            self.cambiar_estado("ESCALA INVALIDA")
+
+            return
+
+        threading.Thread(target=self.ejecutar_puntos,args=(factor,),daemon=True).start() #Ejecuta "ejecutar_puntos" en un hilo aparte
+
+    def ejecutar_puntos(self, factor):
+        #Print("ENTRO A EJECUTAR_PUNTOS")
+        #print("Coordenadas:", len(self.coordenadas))
+        #self.actualizar_consola("ENTRO A EJECUTAR_PUNTOS")
+        if len(self.coordenadas) == 0: #verifica que exista una trayectoria
+            return
+    
+        # =====================================
+        # GUARDAR PUNTO INICIAL
+        # =====================================
+    
+        x_inicio = self.coordenadas[0][0] * factor #obtiene la primer posición
+        y_inicio = self.coordenadas[0][1] * factor #obtiene la primer posición
+        print("x_inicio =", x_inicio)
+        print("y_inicio =", y_inicio)
+        # =====================================
+        # ENVIAR POSICION REAL DEL ROBOT
+        # =====================================
+        
+        if ser and ser.is_open:
+            print("ROBOT X =", self.robot_x)
+            print("ROBOT Y =", self.robot_y)
+            comando = (f"SETPOS:{self.robot_x:.2f},"f"{self.robot_y:.2f},"f"{self.robot_yaw:.2f}\n")
+            ser.reset_input_buffer()
+            ser.write(comando.encode()) #envia SETPOS
+            #print("Enviado:", comando.strip())
+            #self.actualizar_consola(f"TX: {comando.strip()}")
+            self.actualizar_consola(f"Posicion inicial enviada: {comando.strip()}") #Muestra el mensaje en la interfaz
+        
+            while True: #Espera la confirmación
+        
+                if ser.in_waiting:
+        
+                    respuesta = ser.readline().decode(errors="ignore").strip()
+                    print("Recibido:", respuesta)
+                #    self.actualizar_consola(f"RX: {respuesta}")
+                    if respuesta == "ACK":
+                        break
+        
+                time.sleep(0.01)
+        
+        # =====================================
+        # IR AL INICIO
+        # =====================================
+    
+        comando = f"GOTO:{x_inicio:.2f},{y_inicio:.2f}\n"
+
+        if ser and ser.is_open:
+    
+            ser.write(comando.encode()) #Envia comando GOTO
+            ser.reset_input_buffer()
+            self.actualizar_consola(f"Moviendo al inicio: {comando.strip()}")
+    
+            while True: #Espera al ACK para mandar otro GOTO
+    
+                if ser.in_waiting:
+    
+                    respuesta = ser.readline().decode(errors="ignore").strip()
+    
+                    if respuesta == "ACK":
+                        break
+    
+                time.sleep(0.01)
+    
+        # =====================================
+        # RECORRER CAD
+        # =====================================
+    
+        for tray in self.coordenadas:
+    
+            x_mm = tray[2] * factor
+            y_mm = tray[3] * factor
+            pintar = tray[4] #NUEVO
+            velocidad = tray[5] #NUEVO
+            inspeccionar = tray[6] #NUEVO
+            
+            comando = f"GOTO:{x_mm:.2f},{y_mm:.2f}\n"
+    
+            if ser and ser.is_open:
+              #  print("Antes del write")
+                ser.reset_input_buffer()
+                ser.write(comando.encode())
+              #  print("Despues del write")
+                self.actualizar_consola(f"Enviado: {comando.strip()}")
+    
+                while True:
+    
+                    if ser.in_waiting:
+    
+                        respuesta = ser.readline().decode(errors="ignore").strip()
+    
+                        if respuesta == "ACK":
+                            break
+    
+                    time.sleep(0.01)
+    
+            self.resaltar_punto_actual(x_mm, y_mm)
+    
+        # =====================================
+        # VOLVER AL INICIO
+        # =====================================
+    
+        comando = f"GOTO:{x_inicio:.2f},{y_inicio:.2f}\n"
+    
+        if ser and ser.is_open:
+            ser.reset_input_buffer()
+            ser.write(comando.encode())
+    
+            self.actualizar_consola(f"Volviendo al inicio: {comando.strip()}")
+    
+            while True:
+    
+                if ser.in_waiting:
+    
+                    respuesta = ser.readline().decode(errors="ignore").strip()
+    
+                    if respuesta == "ACK":
+                        break
+    
+                time.sleep(0.01)
+    
+        self.cambiar_estado("TRAYECTORIA FINALIZADA")
+
+    # ==========================================
+    # DXF
+    # ==========================================
+
+    def procesar_cad(self): #extrae el inicio y final de cada linea y polilinea
+
+        archivo = filedialog.askopenfilename(title="Seleccionar DXF",filetypes=(("Archivos DXF","*.dxf"),))
+
+        if not archivo:
+            return
+
+        self.ruta_cad = archivo
+        self.coordenadas = [] #Aca se guardan las posiciones de cada linea y polilinea
+        self.txt_log.delete("0.0","end")
+
+        try:
+
+            doc = ezdxf.readfile(archivo)
+            msp = doc.modelspace()
+            for entity in msp.query('LINE LWPOLYLINE'):
+
+                if entity.dxftype() == 'LINE':
+
+                    start = entity.dxf.start
+                    end = entity.dxf.end
+                    self.coordenadas.append([start.x,start.y,end.x,end.y,True,120,True]) #NUEVO
+
+                elif entity.dxftype() == 'LWPOLYLINE':
+
+                    puntos = list(entity.vertices())
+
+                    for i in range(len(puntos)-1):
+
+                        p1 = puntos[i]
+                        p2 = puntos[i+1]
+
+                        self.coordenadas.append([p1[0],p1[1],p2[0],p2[1]])
+            #print("COORDENADAS EXTRAIDAS:", len(self.coordenadas))
+
+            for c in self.coordenadas[:5]:
+                print(c)
+            self.actualizar_vista_previa()
+
+        except Exception as e:
+
+            print(e)
+    # ==========================================
+    # UTILIDADES
+    # ==========================================
+
+    def actualizar_consola(self,mensaje):
+
+        self.txt_log.insert("end",f"{mensaje}\n")
+
+        self.txt_log.see("end")
+
+    def cambiar_estado(self,mensaje):
+
+        self.lbl_estado.configure(text=mensaje)
+
+    # ==========================================
+    # CERRAR
+    # ==========================================
+
+    def on_closing(self):
+
+        self.camera_running = False
+
+        if self.cap:
+            self.cap.release()
+
+        plt.close('all')
+
+        self.destroy()
+
+    def inspeccionar_linea(self, frame): #NUEVO
+    
+        x = 500
+        y = 300
+        ancho = 180
+        alto = 180
+    
+        roi = frame[y:y+alto, x:x+ancho]
+    
+        cv2.rectangle(frame,(x, y),(x+ancho, y+alto),(0,255,0),2)
+    
+        gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    
+        _, binaria = cv2.threshold(gris,60,255,cv2.THRESH_BINARY_INV)
+    
+        contornos, _ = cv2.findContours(binaria,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    
+        cv2.imshow("ROI", roi)
+        cv2.imshow("Binaria", binaria)
+    
+        if len(contornos) == 0:
+            print("No hay tinta")
+            return
+    
+        mayor = max(contornos, key=cv2.contourArea)
+    
+        area = cv2.contourArea(mayor)
+    
+        cv2.drawContours(roi,[mayor],-1,(0,255,0),2)
+    
+        print("Área:", area)
+# ==========================================
+# MAIN
+# ==========================================
+
+if __name__ == "__main__":
+
+    app = InterfazCADCompleta()
+
+    app.protocol("WM_DELETE_WINDOW",app.on_closing)
+
+    app.mainloop()
