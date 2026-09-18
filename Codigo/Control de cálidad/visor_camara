@@ -22,6 +22,7 @@ while True:
 
             # Decodificar imagen
             imagen = cv2.imdecode(datos, cv2.IMREAD_COLOR)
+            print("Resolución recibida:", imagen.shape[1], "x", imagen.shape[0])
 
             if imagen is not None:
 

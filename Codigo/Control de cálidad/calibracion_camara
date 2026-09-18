@@ -1,0 +1,776 @@
+import cv2
+import requests
+import numpy as np
+import math
+import json
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+CAMERA_IP = "192.168.1.91"
+URL = f"http://{CAMERA_IP}/capture"
+
+NOMBRE_CALIBRACION = "calibracion.json"
+
+
+# ============================================================
+# VARIABLES
+# ============================================================
+
+imagen_original = None
+imagen_mostrar = None
+
+puntos = []
+
+mediciones = []
+
+
+# ============================================================
+# OBTENER IMAGEN
+# ============================================================
+
+def obtener_imagen():
+
+    try:
+
+        response = requests.get(
+            URL,
+            timeout=5
+        )
+
+        if response.status_code == 200:
+
+            datos = np.frombuffer(
+                response.content,
+                dtype=np.uint8
+            )
+
+            imagen = cv2.imdecode(
+                datos,
+                cv2.IMREAD_COLOR
+            )
+
+            return imagen
+
+        else:
+
+            print(
+                "Error HTTP:",
+                response.status_code
+            )
+
+            return None
+
+    except requests.exceptions.RequestException as e:
+
+        print(
+            "Error de conexión:",
+            e
+        )
+
+        return None
+
+
+# ============================================================
+# CLICK DEL MOUSE
+# ============================================================
+
+def seleccionar_punto(
+    event,
+    x,
+    y,
+    flags,
+    param
+):
+
+    global imagen_mostrar
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+
+        # Solo permitimos dos puntos
+        if len(puntos) >= 2:
+
+            return
+
+        puntos.append(
+            (x, y)
+        )
+
+        print(
+            f"Punto {len(puntos)}: "
+            f"X={x}, Y={y}"
+        )
+
+        # Dibujar punto
+        cv2.circle(
+            imagen_mostrar,
+            (x, y),
+            5,
+            (0, 0, 255),
+            -1
+        )
+
+        # Si tenemos dos puntos
+        if len(puntos) == 2:
+
+            x1, y1 = puntos[0]
+            x2, y2 = puntos[1]
+
+            # Dibujar línea
+            cv2.line(
+                imagen_mostrar,
+                (x1, y1),
+                (x2, y2),
+                (0, 255, 0),
+                2
+            )
+
+        cv2.imshow(
+            "Calibracion de Camara",
+            imagen_mostrar
+        )
+
+
+# ============================================================
+# CALCULAR DISTANCIA ENTRE DOS PUNTOS
+# ============================================================
+
+def distancia_pixeles(
+    punto1,
+    punto2
+):
+
+    x1, y1 = punto1
+    x2, y2 = punto2
+
+    distancia = math.sqrt(
+        (x2 - x1) ** 2 +
+        (y2 - y1) ** 2
+    )
+
+    return distancia
+
+
+# ============================================================
+# MOSTRAR MEDICIONES
+# ============================================================
+
+def mostrar_mediciones():
+
+    print()
+    print(
+        "=========================================="
+    )
+
+    print(
+        "          MEDICIONES REALIZADAS"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    for i, medicion in enumerate(
+        mediciones,
+        start=1
+    ):
+
+        print(
+            f"{i:02d} | "
+            f"{medicion['distancia_real_mm']:.2f} mm | "
+            f"{medicion['distancia_pixeles']:.2f} px | "
+            f"{medicion['pixeles_por_mm']:.4f} px/mm"
+        )
+
+    print(
+        "=========================================="
+    )
+
+
+# ============================================================
+# CALIBRACIÓN FINAL
+# ============================================================
+
+def calcular_calibracion():
+
+    if len(mediciones) < 2:
+
+        print()
+        print(
+            "Se necesitan al menos "
+            "2 mediciones."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Datos
+    # --------------------------------------------------------
+
+    mm = np.array(
+        [
+            m["distancia_real_mm"]
+            for m in mediciones
+        ],
+        dtype=float
+    )
+
+    pixeles = np.array(
+        [
+            m["distancia_pixeles"]
+            for m in mediciones
+        ],
+        dtype=float
+    )
+
+    # --------------------------------------------------------
+    # Regresión lineal
+    #
+    # pixeles = a * mm + b
+    # --------------------------------------------------------
+
+    a, b = np.polyfit(
+        mm,
+        pixeles,
+        1
+    )
+
+    # Valores predichos
+    pixeles_pred = (
+        a * mm + b
+    )
+
+    # --------------------------------------------------------
+    # R²
+    # --------------------------------------------------------
+
+    ss_res = np.sum(
+        (pixeles - pixeles_pred) ** 2
+    )
+
+    ss_tot = np.sum(
+        (pixeles - np.mean(pixeles)) ** 2
+    )
+
+    if ss_tot != 0:
+
+        r2 = 1 - (
+            ss_res / ss_tot
+        )
+
+    else:
+
+        r2 = 1.0
+
+    # --------------------------------------------------------
+    # Errores
+    # --------------------------------------------------------
+
+    errores_porcentuales = []
+
+    for real, medido in zip(
+        mm,
+        pixeles
+    ):
+
+        # Predicción de píxeles
+        esperado = (
+            a * real + b
+        )
+
+        error = abs(
+            medido - esperado
+        )
+
+        error_porcentual = (
+            error / medido
+        ) * 100
+
+        errores_porcentuales.append(
+            error_porcentual
+        )
+
+    error_promedio = np.mean(
+        errores_porcentuales
+    )
+
+    # --------------------------------------------------------
+    # Escalas
+    # --------------------------------------------------------
+
+    pixeles_por_mm = a
+
+    mm_por_pixel = 1 / a
+
+    # --------------------------------------------------------
+    # Mostrar resultados
+    # --------------------------------------------------------
+
+    print()
+    print()
+    print(
+        "=========================================="
+    )
+
+    print(
+        "       CALIBRACIÓN MULTIPUNTO"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    print(
+        f"Cantidad de mediciones : "
+        f"{len(mediciones)}"
+    )
+
+    print()
+
+    print(
+        f"Coeficiente a          : "
+        f"{a:.8f}"
+    )
+
+    print(
+        f"Coeficiente b          : "
+        f"{b:.8f}"
+    )
+
+    print()
+
+    print(
+        "Ecuación:"
+    )
+
+    print(
+        f"px = {a:.6f} × mm + {b:.6f}"
+    )
+
+    print()
+
+    print(
+        f"Escala                 : "
+        f"{pixeles_por_mm:.6f} px/mm"
+    )
+
+    print(
+        f"Escala inversa         : "
+        f"{mm_por_pixel:.6f} mm/px"
+    )
+
+    print()
+
+    print(
+        f"R²                     : "
+        f"{r2:.8f}"
+    )
+
+    print(
+        f"Error promedio         : "
+        f"{error_promedio:.3f} %"
+    )
+
+    print(
+        "=========================================="
+    )
+
+    # --------------------------------------------------------
+    # Mostrar tabla
+    # --------------------------------------------------------
+
+    print()
+
+    print(
+        "Medición | Real (mm) | "
+        "Píxeles | Esperado | Error"
+    )
+
+    print(
+        "------------------------------------------"
+    )
+
+    for i in range(
+        len(mediciones)
+    ):
+
+        real = mm[i]
+
+        medido = pixeles[i]
+
+        esperado = pixeles_pred[i]
+
+        error = errores_porcentuales[i]
+
+        print(
+            f"{i + 1:^8} | "
+            f"{real:^10.2f} | "
+            f"{medido:^8.2f} | "
+            f"{esperado:^8.2f} | "
+            f"{error:^6.3f}%"
+        )
+
+    # --------------------------------------------------------
+    # Guardar JSON
+    # --------------------------------------------------------
+
+    calibracion = {
+
+        "camera_ip": CAMERA_IP,
+
+        "resolucion": {
+
+            "ancho":
+                int(
+                    imagen_original.shape[1]
+                ),
+
+            "alto":
+                int(
+                    imagen_original.shape[0]
+                )
+        },
+
+        "tipo_calibracion":
+            "multipunto",
+
+        "cantidad_mediciones":
+            len(mediciones),
+
+        "coeficiente_a":
+            float(a),
+
+        "coeficiente_b":
+            float(b),
+
+        "pixeles_por_mm":
+            float(pixeles_por_mm),
+
+        "mm_por_pixel":
+            float(mm_por_pixel),
+
+        "r2":
+            float(r2),
+
+        "error_promedio_porcentual":
+            float(error_promedio),
+
+        "mediciones":
+            mediciones
+    }
+
+    with open(
+        NOMBRE_CALIBRACION,
+        "w"
+    ) as archivo:
+
+        json.dump(
+            calibracion,
+            archivo,
+            indent=4
+        )
+
+    print()
+
+    print(
+        f"Calibración guardada en: "
+        f"{NOMBRE_CALIBRACION}"
+    )
+
+
+# ============================================================
+# OBTENER IMAGEN
+# ============================================================
+
+print()
+print(
+    "=========================================="
+)
+
+print(
+    "        CALIBRACIÓN ESP32-CAM"
+)
+
+print(
+    "=========================================="
+)
+
+print()
+
+print(
+    "Resolución esperada: 640 x 480"
+)
+
+print(
+    "Cámara:",
+    CAMERA_IP
+)
+
+print()
+
+imagen_original = obtener_imagen()
+
+if imagen_original is None:
+
+    print(
+        "No se pudo obtener la imagen."
+    )
+
+    exit()
+
+
+# Copia para mostrar
+
+imagen_mostrar = (
+    imagen_original.copy()
+)
+
+
+# ============================================================
+# CONFIGURAR VENTANA
+# ============================================================
+
+cv2.namedWindow(
+    "Calibracion de Camara"
+)
+
+cv2.setMouseCallback(
+    "Calibracion de Camara",
+    seleccionar_punto
+)
+
+
+# ============================================================
+# INSTRUCCIONES
+# ============================================================
+
+print(
+    "INSTRUCCIONES"
+)
+
+print(
+    "------------------------------------------"
+)
+
+print(
+    "1. Hacé click en dos puntos de la regla."
+)
+
+print(
+    "2. Ingresá la distancia real en mm."
+)
+
+print(
+    "3. Repetí con diferentes distancias."
+)
+
+print()
+
+print(
+    "Ejemplo:"
+)
+
+print(
+    "20 mm, 40 mm, 60 mm, 80 mm..."
+)
+
+print()
+
+print(
+    "R = reiniciar puntos"
+)
+
+print(
+    "F = finalizar calibración"
+)
+
+print(
+    "ESC = salir"
+)
+
+print(
+    "------------------------------------------"
+)
+
+
+# ============================================================
+# LOOP PRINCIPAL
+# ============================================================
+
+while True:
+
+    cv2.imshow(
+        "Calibracion de Camara",
+        imagen_mostrar
+    )
+
+    tecla = (
+        cv2.waitKey(1) & 0xFF
+    )
+
+    # --------------------------------------------------------
+    # ESC
+    # --------------------------------------------------------
+
+    if tecla == 27:
+
+        break
+
+    # --------------------------------------------------------
+    # R = reiniciar puntos
+    # --------------------------------------------------------
+
+    elif tecla == ord("r"):
+
+        puntos.clear()
+
+        imagen_mostrar = (
+            imagen_original.copy()
+        )
+
+        print()
+        print(
+            "Puntos reiniciados."
+        )
+
+    # --------------------------------------------------------
+    # F = finalizar
+    # --------------------------------------------------------
+
+    elif tecla == ord("f"):
+
+        calcular_calibracion()
+
+        break
+
+    # --------------------------------------------------------
+    # DOS PUNTOS SELECCIONADOS
+    # --------------------------------------------------------
+
+    if len(puntos) == 2:
+
+        # Calcular distancia
+        distancia = distancia_pixeles(
+            puntos[0],
+            puntos[1]
+        )
+
+        print()
+
+        print(
+            "------------------------------------------"
+        )
+
+        print(
+            f"Distancia en imagen: "
+            f"{distancia:.3f} píxeles"
+        )
+
+        # Pedir distancia real
+        while True:
+
+            try:
+
+                entrada = input(
+                    "Distancia real en mm "
+                    "(o ENTER para cancelar): "
+                )
+
+                if entrada == "":
+
+                    puntos.clear()
+
+                    imagen_mostrar = (
+                        imagen_original.copy()
+                    )
+
+                    break
+
+                distancia_real = float(
+                    entrada
+                )
+
+                if distancia_real <= 0:
+
+                    print(
+                        "La distancia debe ser "
+                        "mayor que 0."
+                    )
+
+                    continue
+
+                # --------------------------------------------
+                # Guardar medición
+                # --------------------------------------------
+
+                px_mm = (
+                    distancia /
+                    distancia_real
+                )
+
+                medicion = {
+
+                    "punto_1": {
+
+                        "x": puntos[0][0],
+                        "y": puntos[0][1]
+                    },
+
+                    "punto_2": {
+
+                        "x": puntos[1][0],
+                        "y": puntos[1][1]
+                    },
+
+                    "distancia_pixeles":
+                        float(distancia),
+
+                    "distancia_real_mm":
+                        float(distancia_real),
+
+                    "pixeles_por_mm":
+                        float(px_mm)
+                }
+
+                mediciones.append(
+                    medicion
+                )
+
+                print()
+
+                print(
+                    f"Medición #{len(mediciones)} "
+                    "guardada."
+                )
+
+                print(
+                    f"{distancia_real:.2f} mm "
+                    f"= {distancia:.2f} px"
+                )
+
+                # Mostrar mediciones
+                mostrar_mediciones()
+
+                print()
+
+                print(
+                    "Seleccioná otros dos "
+                    "puntos para continuar."
+                )
+
+                # Reiniciar puntos
+                puntos.clear()
+
+                imagen_mostrar = (
+                    imagen_original.copy()
+                )
+
+                break
+
+            except ValueError:
+
+                print(
+                    "Ingresá un número válido."
+                )
