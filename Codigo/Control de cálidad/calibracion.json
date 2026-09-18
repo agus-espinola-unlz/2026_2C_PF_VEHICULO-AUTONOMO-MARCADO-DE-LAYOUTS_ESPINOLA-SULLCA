@@ -1,0 +1,82 @@
+{
+    "camera_ip": "192.168.1.91",
+    "resolucion": {
+        "ancho": 640,
+        "alto": 480
+    },
+    "tipo_calibracion": "multipunto",
+    "cantidad_mediciones": 5,
+    "coeficiente_a": 4.230042235743977,
+    "coeficiente_b": 3.607762828034764,
+    "pixeles_por_mm": 4.230042235743977,
+    "mm_por_pixel": 0.23640425893386396,
+    "r2": 0.9997253099988533,
+    "error_promedio_porcentual": 1.015421651472152,
+    "mediciones": [
+        {
+            "punto_1": {
+                "x": 228,
+                "y": 468
+            },
+            "punto_2": {
+                "x": 228,
+                "y": 382
+            },
+            "distancia_pixeles": 86.0,
+            "distancia_real_mm": 20.0,
+            "pixeles_por_mm": 4.3
+        },
+        {
+            "punto_1": {
+                "x": 226,
+                "y": 470
+            },
+            "punto_2": {
+                "x": 229,
+                "y": 296
+            },
+            "distancia_pixeles": 174.0258601472781,
+            "distancia_real_mm": 40.0,
+            "pixeles_por_mm": 4.350646503681952
+        },
+        {
+            "punto_1": {
+                "x": 227,
+                "y": 469
+            },
+            "punto_2": {
+                "x": 228,
+                "y": 210
+            },
+            "distancia_pixeles": 259.0019304947359,
+            "distancia_real_mm": 60.0,
+            "pixeles_por_mm": 4.316698841578932
+        },
+        {
+            "punto_1": {
+                "x": 226,
+                "y": 470
+            },
+            "punto_2": {
+                "x": 229,
+                "y": 126
+            },
+            "distancia_pixeles": 344.01308114663317,
+            "distancia_real_mm": 80.0,
+            "pixeles_por_mm": 4.300163514332914
+        },
+        {
+            "punto_1": {
+                "x": 227,
+                "y": 468
+            },
+            "punto_2": {
+                "x": 230,
+                "y": 44
+            },
+            "distancia_pixeles": 424.0106130747201,
+            "distancia_real_mm": 100.0,
+            "pixeles_por_mm": 4.2401061307472006
+        }
+    ]
+}
