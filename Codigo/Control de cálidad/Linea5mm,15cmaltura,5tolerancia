@@ -1,0 +1,642 @@
+import cv2
+import requests
+import numpy as np
+import time
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+CAMERA_IP = "192.168.1.91"
+
+URL = f"http://{CAMERA_IP}/capture"
+
+# ------------------------------------------------------------
+# DATOS DE LA PIEZA DE PRUEBA
+# ------------------------------------------------------------
+
+ANCHO_REAL_MM = 5.0
+
+TOLERANCIA = 0.05
+
+MIN_MM = ANCHO_REAL_MM * (1 - TOLERANCIA)
+MAX_MM = ANCHO_REAL_MM * (1 + TOLERANCIA)
+
+# ------------------------------------------------------------
+# CALIBRACIÓN
+# ------------------------------------------------------------
+#
+# Valor provisional de la calibración anterior.
+#
+# 4.230 px/mm
+# => 0.2364 mm/px
+#
+# IMPORTANTE:
+# Este valor deberá verificarse a 15 cm.
+#
+
+PIXEL_POR_MM = 3.95
+
+MM_POR_PIXEL = 1.0 / PIXEL_POR_MM
+
+
+# ============================================================
+# PARÁMETROS DE PROCESAMIENTO
+# ============================================================
+
+# Suavizado
+BLUR_SIZE = 5
+
+# Kernel utilizado para eliminar variaciones lentas
+# de iluminación.
+#
+# La línea mide aproximadamente 5 mm.
+# Con ~4.23 px/mm serían unos 21 píxeles.
+#
+# Usamos un kernel bastante mayor.
+BLACKHAT_KERNEL = 61
+
+# Cantidad de perfiles que vamos a medir
+CANTIDAD_PERFILES = 40
+
+# Ignorar los extremos de la línea
+MARGEN_PERFIL = 0.15
+
+
+# ============================================================
+# FUNCIONES
+# ============================================================
+
+def obtener_imagen():
+    """
+    Obtiene una imagen JPEG directamente desde la ESP32-CAM.
+    """
+
+    respuesta = requests.get(URL, timeout=5)
+
+    datos = np.frombuffer(
+        respuesta.content,
+        dtype=np.uint8
+    )
+
+    imagen = cv2.imdecode(
+        datos,
+        cv2.IMREAD_COLOR
+    )
+
+    return imagen
+
+
+def crear_mascara(imagen):
+    """
+    Genera una máscara donde la línea negra queda en blanco.
+
+    Se utiliza Black Hat para compensar iluminación
+    no uniforme.
+    """
+
+    gris = cv2.cvtColor(
+        imagen,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    gris = cv2.GaussianBlur(
+        gris,
+        (BLUR_SIZE, BLUR_SIZE),
+        0
+    )
+
+    # --------------------------------------------------------
+    # BLACK HAT
+    #
+    # Detecta regiones oscuras sobre un fondo claro.
+    # --------------------------------------------------------
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (BLACKHAT_KERNEL, BLACKHAT_KERNEL)
+    )
+
+    blackhat = cv2.morphologyEx(
+        gris,
+        cv2.MORPH_BLACKHAT,
+        kernel
+    )
+
+    # --------------------------------------------------------
+    # THRESHOLD AUTOMÁTICO
+    # --------------------------------------------------------
+
+    _, mascara = cv2.threshold(
+        blackhat,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # --------------------------------------------------------
+    # LIMPIEZA
+    # --------------------------------------------------------
+
+    kernel_pequeno = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (3, 3)
+    )
+
+    mascara = cv2.morphologyEx(
+        mascara,
+        cv2.MORPH_OPEN,
+        kernel_pequeno
+    )
+
+    mascara = cv2.morphologyEx(
+        mascara,
+        cv2.MORPH_CLOSE,
+        kernel_pequeno
+    )
+
+    return gris, blackhat, mascara
+
+
+def encontrar_linea(mascara):
+    """
+    Busca la línea negra principal.
+    """
+
+    contornos, _ = cv2.findContours(
+        mascara,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    candidato = None
+    mayor_area = 0
+
+    for contorno in contornos:
+
+        area = cv2.contourArea(contorno)
+
+        # Eliminar ruido pequeño
+        if area < 200:
+            continue
+
+        rect = cv2.minAreaRect(contorno)
+
+        (cx, cy), (w, h), angulo = rect
+
+        ancho = min(w, h)
+        largo = max(w, h)
+
+        # Una línea debería ser claramente alargada
+        if largo < ancho * 3:
+            continue
+
+        if area > mayor_area:
+
+            mayor_area = area
+
+            candidato = contorno
+
+    return candidato
+
+
+def medir_linea(imagen, gris, contorno):
+    """
+    Mide el ancho de la línea utilizando múltiples
+    perfiles perpendiculares a su dirección.
+    """
+
+    rect = cv2.minAreaRect(contorno)
+
+    (cx, cy), (w, h), angulo = rect
+
+    # --------------------------------------------------------
+    # Determinar orientación de la línea
+    # --------------------------------------------------------
+
+    if w < h:
+
+        # Línea aproximadamente vertical
+        angulo_linea = angulo
+
+    else:
+
+        # Línea aproximadamente horizontal
+        angulo_linea = angulo + 90
+
+    # --------------------------------------------------------
+    # Obtener puntos del rectángulo
+    # --------------------------------------------------------
+
+    puntos = cv2.boxPoints(rect)
+    puntos = np.int32(puntos)
+
+    # --------------------------------------------------------
+    # Bounding box
+    # --------------------------------------------------------
+
+    x, y, ancho, alto = cv2.boundingRect(contorno)
+
+    # Evitar medir exactamente en los extremos
+    margen_y = int(alto * MARGEN_PERFIL)
+
+    y_inicio = y + margen_y
+    y_fin = y + alto - margen_y
+
+    # --------------------------------------------------------
+    # Caso línea vertical
+    # --------------------------------------------------------
+
+    mediciones = []
+
+    if alto > ancho:
+
+        centro_x = int(cx)
+
+        ys = np.linspace(
+            y_inicio,
+            y_fin,
+            CANTIDAD_PERFILES
+        ).astype(int)
+
+        for yy in ys:
+
+            fila = gris[
+                yy,
+                max(0, x - 20):
+                min(gris.shape[1], x + ancho + 20)
+            ]
+
+            offset = max(0, x - 20)
+
+            # Umbral local basado en el mínimo
+            minimo = np.min(fila)
+
+            # Umbral relativo
+            umbral = minimo + (
+                np.max(fila) - minimo
+            ) * 0.35
+
+            indices = np.where(
+                fila < umbral
+            )[0]
+
+            if len(indices) < 2:
+                continue
+
+            izquierda = offset + indices[0]
+            derecha = offset + indices[-1]
+
+            ancho_px = derecha - izquierda + 1
+
+            # Filtrar mediciones absurdas
+            if 5 <= ancho_px <= 100:
+
+                mediciones.append(ancho_px)
+
+    # --------------------------------------------------------
+    # Caso línea horizontal
+    # --------------------------------------------------------
+
+    else:
+
+        centro_y = int(cy)
+
+        xs = np.linspace(
+            x + int(ancho * MARGEN_PERFIL),
+            x + ancho - int(ancho * MARGEN_PERFIL),
+            CANTIDAD_PERFILES
+        ).astype(int)
+
+        for xx in xs:
+
+            columna = gris[
+                max(0, y - 20):
+                min(gris.shape[0], y + alto + 20),
+                xx
+            ]
+
+            offset = max(0, y - 20)
+
+            minimo = np.min(columna)
+
+            umbral = minimo + (
+                np.max(columna) - minimo
+            ) * 0.35
+
+            indices = np.where(
+                columna < umbral
+            )[0]
+
+            if len(indices) < 2:
+                continue
+
+            arriba = offset + indices[0]
+            abajo = offset + indices[-1]
+
+            ancho_px = abajo - arriba + 1
+
+            if 5 <= ancho_px <= 100:
+
+                mediciones.append(ancho_px)
+
+    # --------------------------------------------------------
+    # Resultado
+    # --------------------------------------------------------
+
+    if len(mediciones) < 5:
+        return None
+
+    # Eliminar valores extremos
+    mediciones = np.array(
+        mediciones,
+        dtype=np.float32
+    )
+
+    q1 = np.percentile(
+        mediciones,
+        25
+    )
+
+    q3 = np.percentile(
+        mediciones,
+        75
+    )
+
+    iqr = q3 - q1
+
+    limite_inferior = q1 - 1.5 * iqr
+    limite_superior = q3 + 1.5 * iqr
+
+    mediciones_filtradas = mediciones[
+        (mediciones >= limite_inferior) &
+        (mediciones <= limite_superior)
+    ]
+
+    if len(mediciones_filtradas) < 5:
+        return None
+
+    # Mediana
+    ancho_px = float(
+        np.median(mediciones_filtradas)
+    )
+
+    ancho_mm = (
+        ancho_px *
+        MM_POR_PIXEL
+    )
+
+    # Error respecto a 5 mm
+    error_porcentual = (
+        abs(ancho_mm - ANCHO_REAL_MM)
+        / ANCHO_REAL_MM
+    ) * 100
+
+    # Determinar OK/NOK
+    if MIN_MM <= ancho_mm <= MAX_MM:
+
+        estado = "OK"
+
+    else:
+
+        estado = "FUERA DE TOLERANCIA"
+
+    return {
+        "rect": rect,
+        "mediciones": mediciones_filtradas,
+        "ancho_px": ancho_px,
+        "ancho_mm": ancho_mm,
+        "error": error_porcentual,
+        "estado": estado
+    }
+
+
+# ============================================================
+# PROGRAMA PRINCIPAL
+# ============================================================
+
+print()
+print("==============================================")
+print("      PRUEBA DE MEDICIÓN DE LÍNEA")
+print("==============================================")
+print()
+print(f"Ancho nominal : {ANCHO_REAL_MM:.2f} mm")
+print(f"Tolerancia    : ±{TOLERANCIA * 100:.1f}%")
+print(f"Rango válido  : {MIN_MM:.2f} - {MAX_MM:.2f} mm")
+print()
+print(f"Calibración   : {PIXEL_POR_MM:.4f} px/mm")
+print(f"                {MM_POR_PIXEL:.6f} mm/px")
+print()
+print("ESC para salir")
+print()
+print("==============================================")
+
+while True:
+
+    try:
+
+        # ----------------------------------------------------
+        # CAPTURAR IMAGEN
+        # ----------------------------------------------------
+
+        imagen = obtener_imagen()
+
+        if imagen is None:
+
+            print("No se pudo obtener imagen")
+            time.sleep(1)
+            continue
+
+        # ----------------------------------------------------
+        # PROCESAMIENTO
+        # ----------------------------------------------------
+
+        gris, blackhat, mascara = crear_mascara(
+            imagen
+        )
+
+        # ----------------------------------------------------
+        # BUSCAR LÍNEA
+        # ----------------------------------------------------
+
+        contorno = encontrar_linea(
+            mascara
+        )
+
+        resultado = imagen.copy()
+
+        if contorno is not None:
+
+            medicion = medir_linea(
+                imagen,
+                gris,
+                contorno
+            )
+
+            # ------------------------------------------------
+            # DIBUJAR CONTORNO
+            # ------------------------------------------------
+
+            cv2.drawContours(
+                resultado,
+                [contorno],
+                -1,
+                (0, 255, 0),
+                2
+            )
+
+            # ------------------------------------------------
+            # MOSTRAR RESULTADO
+            # ------------------------------------------------
+
+            if medicion is not None:
+
+                rect = medicion["rect"]
+
+                puntos = cv2.boxPoints(
+                    rect
+                )
+
+                puntos = np.int32(puntos)
+
+                cv2.polylines(
+                    resultado,
+                    [puntos],
+                    True,
+                    (255, 0, 0),
+                    2
+                )
+
+                ancho_px = medicion["ancho_px"]
+                ancho_mm = medicion["ancho_mm"]
+                error = medicion["error"]
+                estado = medicion["estado"]
+
+                # --------------------------------------------
+                # TEXTO
+                # --------------------------------------------
+
+                cv2.putText(
+                    resultado,
+                    f"Ancho: {ancho_px:.1f} px",
+                    (20, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    resultado,
+                    f"Medicion: {ancho_mm:.2f} mm",
+                    (20, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    resultado,
+                    f"Error: {error:.2f} %",
+                    (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2
+                )
+
+                cv2.putText(
+                    resultado,
+                    estado,
+                    (20, 125),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 255, 0),
+                    2
+                )
+
+                # --------------------------------------------
+                # MARCAR CENTRO
+                # --------------------------------------------
+
+                cx = int(rect[0][0])
+                cy = int(rect[0][1])
+
+                cv2.circle(
+                    resultado,
+                    (cx, cy),
+                    5,
+                    (0, 0, 255),
+                    -1
+                )
+
+                # --------------------------------------------
+                # MOSTRAR MEDICIONES UTILIZADAS
+                # --------------------------------------------
+
+                print(
+                    f"\r"
+                    f"Px: {ancho_px:6.2f} | "
+                    f"Mm: {ancho_mm:6.2f} | "
+                    f"Error: {error:5.2f}% | "
+                    f"{estado}       ",
+                    end=""
+                )
+
+        else:
+
+            cv2.putText(
+                resultado,
+                "LINEA NO DETECTADA",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 0, 255),
+                2
+            )
+
+        # ----------------------------------------------------
+        # MOSTRAR VENTANAS
+        # ----------------------------------------------------
+
+        cv2.imshow(
+            "Imagen original",
+            imagen
+        )
+
+        cv2.imshow(
+            "Black Hat",
+            blackhat
+        )
+
+        cv2.imshow(
+            "Mascara",
+            mascara
+        )
+
+        cv2.imshow(
+            "Medicion",
+            resultado
+        )
+
+        # ----------------------------------------------------
+        # TECLA
+        # ----------------------------------------------------
+
+        tecla = cv2.waitKey(1) & 0xFF
+
+        if tecla == 27:
+            break
+
+    except Exception as e:
+
+        print()
+        print()
+        print("ERROR:", e)
+        print()
+
+        time.sleep(1)
+
+
+cv2.destroyAllWindows()

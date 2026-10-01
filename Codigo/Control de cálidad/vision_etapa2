@@ -1,122 +1,248 @@
-import cv2
-import requests
-import numpy as np
-import time
-
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
-
-CAMERA_IP = "192.168.1.91"
-URL = f"http://{CAMERA_IP}/capture"
-
-# ==========================================
-# CAPTURA
-# ==========================================
-
-while True:
-
-    try:
-        respuesta = requests.get(URL, timeout=5)
-
-        datos = np.frombuffer(
-            respuesta.content,
-            dtype=np.uint8
-        )
-
-        imagen = cv2.imdecode(
-            datos,
-            cv2.IMREAD_COLOR
-        )
-
-        if imagen is None:
-            print("Error: no se pudo decodificar la imagen")
-            continue
-
-        # ==========================================
-        # INFORMACIÓN DE LA IMAGEN
-        # ==========================================
-
-        alto, ancho = imagen.shape[:2]
-
-        print(
-            f"Resolución: {ancho} x {alto}",
-            end="\r"
-        )
-
-        # ==========================================
-        # CONVERSIÓN A ESCALA DE GRISES
-        # ==========================================
-
-        gris = cv2.cvtColor(
-            imagen,
-            cv2.COLOR_BGR2GRAY
-        )
-
-        # ==========================================
-        # SUAVIZADO
-        # ==========================================
-
-        suavizada = cv2.GaussianBlur(
-            gris,
-            (5, 5),
-            0
-        )
-
-        # ==========================================
-        # UMBRAL
-        # ==========================================
-
-        _, mascara = cv2.threshold(
-            suavizada,
-            120,
-            255,
-            cv2.THRESH_BINARY
-        )
-
-        # ==========================================
-        # MOSTRAR
-        # ==========================================
-
-        cv2.imshow(
-            "Imagen original",
-            imagen
-        )
-
-        cv2.imshow(
-            "Escala de grises",
-            gris
-        )
-
-        cv2.imshow(
-            "Suavizada",
-            suavizada
-        )
-
-        cv2.imshow(
-            "Mascara",
-            mascara
-        )
-
-        # ==========================================
-        # TECLADO
-        # ==========================================
-
-        tecla = cv2.waitKey(1) & 0xFF
-
-        if tecla == 27:  # ESC
-            break
-
-    except Exception as e:
-
-        print(
-            f"\nError: {e}"
-        )
-
-        time.sleep(1)
-
-# ==========================================
-# CERRAR
-# ==========================================
-
+import cv2 
+import requests 
+import numpy as np 
+import time 
+ 
+CAMERA_IP = "192.168.1.91" 
+URL = f"http://{CAMERA_IP}/capture" 
+ 
+MM_POR_PIXEL = 0.2364042589 
+ 
+ 
+while True: 
+ 
+    try: 
+ 
+        # ========================================== 
+        # CAPTURA 
+        # ========================================== 
+ 
+        respuesta = requests.get(URL, timeout=5) 
+ 
+        datos = np.frombuffer( 
+            respuesta.content, 
+            dtype=np.uint8 
+        ) 
+ 
+        imagen = cv2.imdecode( 
+            datos, 
+            cv2.IMREAD_COLOR 
+        ) 
+ 
+        if imagen is None: 
+            continue 
+ 
+ 
+        # ========================================== 
+        # ESCALA DE GRISES 
+        # ========================================== 
+ 
+        gris = cv2.cvtColor( 
+            imagen, 
+            cv2.COLOR_BGR2GRAY 
+        ) 
+ 
+ 
+        # ========================================== 
+        # DETECCIÓN DE LA LÍNEA 
+        # ========================================== 
+ 
+        # Umbral solamente para encontrar 
+        # aproximadamente dónde está la línea. 
+ 
+        _, mascara = cv2.threshold( 
+            gris, 
+            90, 
+            255, 
+            cv2.THRESH_BINARY_INV 
+        ) 
+ 
+ 
+        # ========================================== 
+        # BUSCAR CONTORNOS 
+        # ========================================== 
+ 
+        contornos, _ = cv2.findContours( 
+            mascara, 
+            cv2.RETR_EXTERNAL, 
+            cv2.CHAIN_APPROX_SIMPLE 
+        ) 
+ 
+ 
+        resultado = imagen.copy() 
+ 
+        candidato = None 
+ 
+        mayor_area = 0 
+ 
+ 
+        for contorno in contornos: 
+ 
+            area = cv2.contourArea(contorno) 
+ 
+            if area < 500: 
+                continue 
+ 
+            x, y, w, h = cv2.boundingRect(contorno) 
+ 
+            # Buscamos algo alto y relativamente angosto 
+            if h > 150 and w < 150: 
+ 
+                if area > mayor_area: 
+ 
+                    mayor_area = area 
+ 
+                    candidato = (x, y, w, h) 
+ 
+ 
+        # ========================================== 
+        # MEDICIÓN 
+        # ========================================== 
+ 
+        if candidato is not None: 
+ 
+            x, y, w, h = candidato 
+ 
+            centro_x = x + w // 2 
+ 
+ 
+            # Tomamos varias filas dentro de la línea 
+            mediciones_px = [] 
+ 
+ 
+            margen = 30 
+ 
+            x_inicio = max(0, x - margen) 
+            x_fin = min( 
+                gris.shape[1], 
+                x + w + margen 
+            ) 
+ 
+ 
+            for yy in np.linspace( 
+                y + 20, 
+                y + h - 20, 
+                30 
+            ).astype(int): 
+ 
+                fila = gris[yy, x_inicio:x_fin] 
+ 
+ 
+                # Umbral para encontrar píxeles oscuros 
+                indices = np.where(fila < 90)[0] 
+ 
+ 
+                if len(indices) < 5: 
+                    continue 
+ 
+ 
+                # Convertimos a coordenadas de imagen 
+                izquierda = x_inicio + indices[0] 
+                derecha = x_inicio + indices[-1] 
+ 
+ 
+                ancho_px = derecha - izquierda 
+ 
+ 
+                # Filtrar mediciones absurdas 
+                if 10 < ancho_px < 100: 
+ 
+                    mediciones_px.append( 
+                        ancho_px 
+                    ) 
+ 
+ 
+            # ====================================== 
+            # RESULTADO 
+            # ====================================== 
+ 
+            if len(mediciones_px) > 0: 
+ 
+                ancho_px = np.median( 
+                    mediciones_px 
+                ) 
+ 
+                ancho_mm = ( 
+                    ancho_px * 
+                    MM_POR_PIXEL 
+                ) 
+ 
+ 
+                # ---------------------------------- 
+                # MOSTRAR 
+                # ---------------------------------- 
+ 
+                cv2.rectangle( 
+                    resultado, 
+                    (x, y), 
+                    (x + w, y + h), 
+                    (0, 255, 0), 
+                    2 
+                ) 
+ 
+ 
+                texto = ( 
+                    f"{ancho_px:.1f} px" 
+                ) 
+ 
+                cv2.putText( 
+                    resultado, 
+                    texto, 
+                    (x, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, 
+                    (0, 255, 0), 
+                    2 
+                ) 
+ 
+ 
+                texto2 = ( 
+                    f"{ancho_mm:.2f} mm" 
+                ) 
+ 
+                cv2.putText( 
+                    resultado, 
+                    texto2, 
+                    (x, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, 
+                    (0, 255, 0), 
+                    2 
+                ) 
+ 
+ 
+                # Mostrar línea central 
+                cv2.line( 
+                    resultado, 
+                    (centro_x, y), 
+                    (centro_x, y + h), 
+                    (255, 0, 0), 
+                    1 
+                ) 
+ 
+ 
+        # ========================================== 
+        # MOSTRAR 
+        # ========================================== 
+ 
+        cv2.imshow( "Original", imagen ) 
+ 
+        cv2.imshow( "Mascara", mascara ) 
+ 
+        cv2.imshow( "Medicion", resultado ) 
+ 
+ 
+        tecla = cv2.waitKey(1) & 0xFF 
+ 
+        if tecla == 27: 
+            break 
+ 
+ 
+    except Exception as e: 
+ 
+        print("Error:", e) 
+ 
+        time.sleep(1) 
+ 
+ 
 cv2.destroyAllWindows()
