@@ -1,0 +1,1218 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <math.h>
+
+// ============================================================
+// WIFI / TCP / OTA
+// ============================================================
+const char* ssid = "WIRELESS";
+const char* password = "FAMILIA8630";
+
+const uint16_t TCP_PORT = 8888;
+WiFiServer server(TCP_PORT);
+WiFiClient cliente;
+
+const char* OTA_HOSTNAME = "AGV-ESP32";
+// Si queres contraseña OTA, descomentar:
+// const char* OTA_PASSWORD = "agv123";
+
+// ============================================================
+// L298N
+// ============================================================
+const int ENA = 25;
+const int IN1 = 26;
+const int IN2 = 27;
+const int IN3 = 12;
+const int IN4 = 13;
+const int ENB = 14;
+
+// ============================================================
+// I2C / TCA9548A / AS5600
+// ============================================================
+const int SDA_PIN = 21;
+const int SCL_PIN = 22;
+
+const uint8_t TCA_ADDR = 0x70;
+const uint8_t AS5600_ADDR = 0x36;
+const uint8_t AS5600_RAW_ANGLE_H = 0x0C;
+
+const uint8_t CH_ENC_LEFT  = 1;
+const uint8_t CH_ENC_RIGHT = 2;
+
+// ============================================================
+// NUEVO - MPU6050 EN TCA9548A CANAL 0
+// ============================================================
+const uint8_t CH_MPU6050 = 0;
+const uint8_t MPU6050_ADDR = 0x68;
+const uint8_t MPU6050_PWR_MGMT_1 = 0x6B;
+const uint8_t MPU6050_CONFIG = 0x1A;
+const uint8_t MPU6050_GYRO_CONFIG = 0x1B;
+const uint8_t MPU6050_GYRO_ZOUT_H = 0x47;
+
+// Escala +/-250 deg/s = 131 LSB/(deg/s)
+const float MPU_GYRO_SENS = 131.0f;
+
+// Si al girar fisicamente antihorario YAW_IMU baja, cambiar a -1.
+int IMU_YAW_SIGN = +1;
+
+const float COUNTS_PER_REV = 4096.0f;
+
+// ============================================================
+// PARAMETROS MECANICOS / CONTROL
+// ============================================================
+float DIAMETRO_RUEDA_MM = 64.5f;
+
+// CAMBIAR POR LA MEDIDA REAL ENTRE CENTROS DE RUEDAS MOTRICES
+float DISTANCIA_ENTRE_RUEDAS_MM =165.0f;
+
+float RELACION_TRANSMISION = 1.0f;
+
+int ENC_LEFT_SIGN = +1;
+int ENC_RIGHT_SIGN = +1;
+
+int MOTOR_LEFT_SIGN = +1;
+int MOTOR_RIGHT_SIGN = +1;
+
+int PWM_AVANCE = 165;
+int PWM_GIRO   = 145;
+int PWM_MIN    = 90;
+
+// NUEVO - DESACELERACION GIRO
+// Minimo exclusivo para TURN. No modifica MOVE.
+int PWM_MIN_GIRO = 80;
+
+int PWM_MAX    = 220;
+
+float KP_ENCODERS = 0.0f;
+
+float DIST_DESACEL_MM = 80.0f;
+float TOL_DIST_MM = 4.0f;
+float TOL_GIRO_DEG = 2.0f;
+
+unsigned long TELEMETRIA_MS = 120;
+unsigned long TIMEOUT_MOV_MS = 30000;
+
+// ============================================================
+// ESTADOS
+// ============================================================
+enum EstadoMovimiento {
+  IDLE,
+  MOVING_STRAIGHT,
+  TURNING
+};
+
+EstadoMovimiento estadoMovimiento = IDLE;
+
+bool emergencyStop = false;
+bool otaEnProgreso = false;
+
+bool enc1Enabled = true;
+bool enc2Enabled = true;
+
+bool motor1Enabled = true;
+bool motor2Enabled = true;
+
+// Pose odometrica estimada
+float posX = 0.0f;
+float posY = 0.0f;
+float yawDeg = 0.0f;
+
+// ============================================================
+// NUEVO - VARIABLES MPU6050
+// ============================================================
+bool imuOK = false;
+float gyroZBiasDps = 0.0f;
+float gyroZDps = 0.0f;
+float yawImuDeg = 0.0f;
+float yawImuInicioGiro = 0.0f;
+unsigned long lastImuMicros = 0;
+
+// Encoder acumulado
+uint16_t rawLeftPrev = 0;
+uint16_t rawRightPrev = 0;
+
+bool leftInitialized = false;
+bool rightInitialized = false;
+
+long countLeft = 0;
+long countRight = 0;
+
+// Referencia de movimiento actual
+long startCountLeft = 0;
+long startCountRight = 0;
+
+// Objetivos
+float targetDistanceMm = 0.0f;
+float targetTurnDeg = 0.0f;
+float targetTurnWheelMm = 0.0f;
+int turnSign = +1;
+
+// GOTO
+bool gotoPending = false;
+float gotoTargetX = 0.0f;
+float gotoTargetY = 0.0f;
+float gotoDistanceMm = 0.0f;
+
+// Timers
+unsigned long movementStartMs = 0;
+unsigned long lastTelemetryMs = 0;
+
+// Buffer TCP
+String tcpBuffer = "";
+
+// ============================================================
+// UTILIDADES
+// ============================================================
+float wheelCircumferenceMm() {
+  return PI * DIAMETRO_RUEDA_MM;
+}
+
+float countsToMm(long counts) {
+  return ((float)counts / COUNTS_PER_REV) *
+         wheelCircumferenceMm() /
+         RELACION_TRANSMISION;
+}
+
+float normalizeAngleDeg(float angle) {
+  while (angle > 180.0f) angle -= 360.0f;
+  while (angle <= -180.0f) angle += 360.0f;
+  return angle;
+}
+
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+
+// ============================================================
+// NUEVO - MPU6050
+// ============================================================
+bool mpuWriteByte(uint8_t reg, uint8_t value) {
+  tcaSelect(CH_MPU6050);
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+
+  return Wire.endTransmission() == 0;
+}
+
+bool mpuRead16(uint8_t reg, int16_t& value) {
+  tcaSelect(CH_MPU6050);
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  if (Wire.requestFrom((int)MPU6050_ADDR, 2) != 2) {
+    return false;
+  }
+
+  uint8_t highByte = Wire.read();
+  uint8_t lowByte = Wire.read();
+
+  value = (int16_t)((highByte << 8) | lowByte);
+  return true;
+}
+
+bool iniciarMPU6050() {
+  // Despertar MPU6050
+  if (!mpuWriteByte(MPU6050_PWR_MGMT_1, 0x00)) {
+    return false;
+  }
+
+  delay(100);
+
+  // Filtro digital DLPF moderado
+  if (!mpuWriteByte(MPU6050_CONFIG, 0x03)) {
+    return false;
+  }
+
+  // Giroscopio +/-250 deg/s
+  if (!mpuWriteByte(MPU6050_GYRO_CONFIG, 0x00)) {
+    return false;
+  }
+
+  delay(50);
+  return true;
+}
+
+void calibrarGyroZ() {
+  const int muestras = 1200;
+  double suma = 0.0;
+  int validas = 0;
+
+  Serial.println("MPU6050: calibrando gyro Z. NO MOVER EL AGV...");
+
+  for (int i = 0; i < muestras; i++) {
+    int16_t rawZ = 0;
+
+    if (mpuRead16(MPU6050_GYRO_ZOUT_H, rawZ)) {
+      suma += ((float)rawZ / MPU_GYRO_SENS);
+      validas++;
+    }
+
+    delay(2);
+  }
+
+  if (validas > 0) {
+    gyroZBiasDps = (float)(suma / validas);
+    imuOK = true;
+  } else {
+    gyroZBiasDps = 0.0f;
+    imuOK = false;
+  }
+
+  yawImuDeg = 0.0f;
+  lastImuMicros = micros();
+
+  Serial.print("MPU6050: bias gyro Z = ");
+  Serial.print(gyroZBiasDps, 5);
+  Serial.println(" deg/s");
+}
+
+void actualizarIMU() {
+  if (!imuOK) return;
+
+  int16_t rawZ = 0;
+
+  if (!mpuRead16(MPU6050_GYRO_ZOUT_H, rawZ)) {
+    return;
+  }
+
+  unsigned long ahora = micros();
+
+  if (lastImuMicros == 0) {
+    lastImuMicros = ahora;
+    return;
+  }
+
+  float dt = (ahora - lastImuMicros) * 1.0e-6f;
+  lastImuMicros = ahora;
+
+  // Rechazar intervalos anormales para evitar saltos de integracion.
+  if (dt <= 0.0f || dt > 0.1f) {
+    return;
+  }
+
+  float rawDps = (float)rawZ / MPU_GYRO_SENS;
+  gyroZDps = IMU_YAW_SIGN * (rawDps - gyroZBiasDps);
+
+  // Pequeña zona muerta para reducir deriva estando quieto.
+  if (abs(gyroZDps) < 0.15f) {
+    gyroZDps = 0.0f;
+  }
+
+  yawImuDeg = normalizeAngleDeg(
+    yawImuDeg + gyroZDps * dt
+  );
+}
+
+uint16_t readAS5600Raw(uint8_t channel) {
+  tcaSelect(channel);
+
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(AS5600_RAW_ANGLE_H);
+
+  if (Wire.endTransmission(false) != 0) {
+    return 0xFFFF;
+  }
+
+  if (Wire.requestFrom((int)AS5600_ADDR, 2) != 2) {
+    return 0xFFFF;
+  }
+
+  uint16_t highByte = Wire.read();
+  uint16_t lowByte = Wire.read();
+
+  return ((highByte & 0x0F) << 8) | lowByte;
+}
+
+long unwrapDelta(uint16_t current, uint16_t previous) {
+  int delta = (int)current - (int)previous;
+
+  if (delta > 2048) delta -= 4096;
+  if (delta < -2048) delta += 4096;
+
+  return delta;
+}
+
+// ============================================================
+// SALIDA A SERIAL + TCP
+// ============================================================
+void enviarLinea(const String& msg) {
+  Serial.println(msg);
+
+  if (cliente && cliente.connected()) {
+    cliente.println(msg);
+  }
+}
+
+// ============================================================
+// ENCODERS
+// ============================================================
+void leerEncoders() {
+  uint16_t rawL = readAS5600Raw(CH_ENC_LEFT);
+
+  if (rawL != 0xFFFF) {
+    if (!leftInitialized) {
+      rawLeftPrev = rawL;
+      leftInitialized = true;
+    } else {
+      long delta = unwrapDelta(rawL, rawLeftPrev);
+      countLeft += ENC_LEFT_SIGN * delta;
+      rawLeftPrev = rawL;
+    }
+  }
+
+  uint16_t rawR = readAS5600Raw(CH_ENC_RIGHT);
+
+  if (rawR != 0xFFFF) {
+    if (!rightInitialized) {
+      rawRightPrev = rawR;
+      rightInitialized = true;
+    } else {
+      long delta = unwrapDelta(rawR, rawRightPrev);
+      countRight += ENC_RIGHT_SIGN * delta;
+      rawRightPrev = rawR;
+    }
+  }
+}
+
+void resetEncoders() {
+  countLeft = 0;
+  countRight = 0;
+
+  leftInitialized = false;
+  rightInitialized = false;
+
+  delay(5);
+  leerEncoders();
+
+  startCountLeft = countLeft;
+  startCountRight = countRight;
+}
+
+float distLeftFromMoveStart() {
+  return countsToMm(countLeft - startCountLeft);
+}
+
+float distRightFromMoveStart() {
+  return countsToMm(countRight - startCountRight);
+}
+
+float distanciaDisponibleAbs() {
+  float dl = abs(distLeftFromMoveStart());
+  float dr = abs(distRightFromMoveStart());
+
+  if (enc1Enabled && enc2Enabled) return (dl + dr) * 0.5f;
+  if (enc1Enabled) return dl;
+  if (enc2Enabled) return dr;
+
+  return 0.0f;
+}
+
+// ============================================================
+// MOTORES
+// ============================================================
+void setMotor(
+  int inA,
+  int inB,
+  int enPin,
+  int pwmSigned,
+  bool enabled,
+  int motorSign
+) {
+  if (!enabled || emergencyStop || otaEnProgreso || pwmSigned == 0) {
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, LOW);
+    analogWrite(enPin, 0);
+    return;
+  }
+
+  int command = pwmSigned * motorSign;
+  int pwm = constrain(abs(command), 0, PWM_MAX);
+
+  if (command > 0) {
+    digitalWrite(inA, HIGH);
+    digitalWrite(inB, LOW);
+  } else {
+    digitalWrite(inA, LOW);
+    digitalWrite(inB, HIGH);
+  }
+
+  analogWrite(enPin, pwm);
+}
+
+void controlMotores(int pwmLeft, int pwmRight) {
+  setMotor(IN1, IN2, ENA, pwmLeft, motor1Enabled, MOTOR_LEFT_SIGN);
+  setMotor(IN3, IN4, ENB, pwmRight, motor2Enabled, MOTOR_RIGHT_SIGN);
+}
+
+void detenerMotores() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ============================================================
+// MOVIMIENTO RECTO
+// ============================================================
+void comenzarAvance(float distanciaMm) {
+  if (!enc1Enabled && !enc2Enabled) {
+    enviarLinea("ERROR:NO_ENCODERS");
+    return;
+  }
+
+  if (!motor1Enabled && !motor2Enabled) {
+    enviarLinea("ERROR:NO_MOTORS");
+    return;
+  }
+
+  emergencyStop = false;
+
+  targetDistanceMm = abs(distanciaMm);
+
+  startCountLeft = countLeft;
+  startCountRight = countRight;
+
+  movementStartMs = millis();
+  estadoMovimiento = MOVING_STRAIGHT;
+
+  enviarLinea("MOVING:" + String(targetDistanceMm, 2));
+}
+
+void actualizarAvance() {
+  float recorrido = distanciaDisponibleAbs();
+  float restante = targetDistanceMm - recorrido;
+
+  if (restante <= TOL_DIST_MM) {
+    detenerMotores();
+    estadoMovimiento = IDLE;
+
+    float distanciaReal = min(recorrido, targetDistanceMm);
+
+    float yawRad = radians(yawDeg);
+
+    posX += distanciaReal * cos(yawRad);
+    posY += distanciaReal * sin(yawRad);
+
+    if (gotoPending) {
+      posX = gotoTargetX;
+      posY = gotoTargetY;
+      gotoPending = false;
+    }
+
+    enviarLinea("POINT_REACHED");
+    return;
+  }
+
+  if (millis() - movementStartMs > TIMEOUT_MOV_MS) {
+    detenerMotores();
+    estadoMovimiento = IDLE;
+    gotoPending = false;
+
+    enviarLinea("ERROR:MOVE_TIMEOUT");
+    return;
+  }
+
+  int basePwm = PWM_AVANCE;
+
+  if (restante < DIST_DESACEL_MM) {
+    float factor = constrain(restante / DIST_DESACEL_MM, 0.0f, 1.0f);
+
+    basePwm =
+      PWM_MIN +
+      (int)((PWM_AVANCE - PWM_MIN) * factor);
+  }
+
+  int pwmLeft = basePwm;
+  int pwmRight = basePwm;
+
+  // Correccion simple solo si ambos encoders estan activos
+  if (enc1Enabled && enc2Enabled) {
+    float error =
+      abs(distLeftFromMoveStart()) -
+      abs(distRightFromMoveStart());
+
+    int correction = (int)(KP_ENCODERS * error);
+
+    pwmLeft = constrain(
+      basePwm - correction,
+      PWM_MIN,
+      PWM_MAX
+    );
+
+    pwmRight = constrain(
+      basePwm + correction,
+      PWM_MIN,
+      PWM_MAX
+    );
+  }
+
+  controlMotores(pwmLeft, pwmRight);
+}
+
+// ============================================================
+// GIRO POR ENCODERS
+// ============================================================
+void comenzarGiro(float grados, bool esParteDeGoto) {
+  if (!enc1Enabled || !enc2Enabled) {
+    enviarLinea("ERROR:TURN_REQUIRES_2_ENCODERS");
+    return;
+  }
+
+  if (!motor1Enabled || !motor2Enabled) {
+    enviarLinea("ERROR:TURN_REQUIRES_2_MOTORS");
+    return;
+  }
+
+  // ============================================================
+  // NUEVO - PARA GIRAR, EL MPU6050 DEBE ESTAR OPERATIVO
+  // ============================================================
+  if (!imuOK) {
+    enviarLinea("ERROR:MPU6050_NOT_READY");
+    return;
+  }
+
+  emergencyStop = false;
+
+  targetTurnDeg = grados;
+  turnSign = (grados >= 0.0f) ? +1 : -1;
+
+  // La distancia teorica de rueda se conserva para que los encoders
+  // sigan disponibles como referencia/apoyo y diagnostico.
+  // s = PI * L * |angulo| / 360
+  targetTurnWheelMm =
+    PI *
+    DISTANCIA_ENTRE_RUEDAS_MM *
+    abs(grados) /
+    360.0f;
+
+  startCountLeft = countLeft;
+  startCountRight = countRight;
+
+  // ============================================================
+  // NUEVO - REFERENCIA ANGULAR REAL AL COMENZAR EL GIRO
+  // ============================================================
+  yawImuInicioGiro = yawImuDeg;
+
+  gotoPending = esParteDeGoto;
+
+  movementStartMs = millis();
+  estadoMovimiento = TURNING;
+
+  enviarLinea("TURNING:" + String(grados, 2));
+}
+
+void actualizarGiro() {
+  // ============================================================
+  // NUEVO - EL MPU6050 ES LA REFERENCIA PRINCIPAL DEL GIRO
+  // ============================================================
+  float deltaYawImu = normalizeAngleDeg(
+    yawImuDeg - yawImuInicioGiro
+  );
+
+  // Convierte el giro al sentido del objetivo:
+  // TURN:+90 -> progreso positivo si gira antihorario.
+  // TURN:-90 -> progreso positivo si gira horario.
+  float progresoAngular = turnSign * deltaYawImu;
+  float objetivoAngular = abs(targetTurnDeg);
+  float restanteDeg = objetivoAngular - progresoAngular;
+
+  // Los encoders se siguen leyendo y permanecen disponibles como apoyo.
+  float recorridoEncoder = distanciaDisponibleAbs();
+
+  if (
+    progresoAngular >= 0.0f &&
+    restanteDeg <= TOL_GIRO_DEG
+  ) {
+    detenerMotores();
+    estadoMovimiento = IDLE;
+
+    // ============================================================
+    // MODIFICADO - LA ORIENTACION SE ACTUALIZA CON EL GIRO MEDIDO
+    // POR EL MPU6050, NO CON EL ANGULO TEORICO SOLICITADO.
+    // ============================================================
+    yawDeg = normalizeAngleDeg(
+      yawDeg + deltaYawImu
+    );
+
+    if (gotoPending) {
+      comenzarAvance(gotoDistanceMm);
+    } else {
+      enviarLinea("POINT_REACHED");
+    }
+
+    return;
+  }
+
+  if (millis() - movementStartMs > TIMEOUT_MOV_MS) {
+    detenerMotores();
+    estadoMovimiento = IDLE;
+    gotoPending = false;
+
+    enviarLinea("ERROR:TURN_TIMEOUT");
+    return;
+  }
+
+  int pwm = PWM_GIRO;
+
+  // ============================================================
+  // RESTAURADO - LOGICA GIRO ESTABLE
+  // La referencia angular sigue siendo la misma que funcionaba:
+  // deltaYawImu -> progresoAngular -> restanteDeg.
+  //
+  // NUEVO - DESACELERACION GIRO
+  // Solo se modifica la velocidad de aproximacion al objetivo.
+  // ============================================================
+  const float DESACEL_GIRO_DEG = 35.0f;
+
+  if (restanteDeg < DESACEL_GIRO_DEG) {
+    float factor = constrain(
+      restanteDeg / DESACEL_GIRO_DEG,
+      0.0f,
+      1.0f
+    );
+
+    pwm =
+      PWM_MIN_GIRO +
+      (int)((PWM_GIRO - PWM_MIN_GIRO) * factor);
+  }
+
+  // Evita warning por variable de apoyo y deja explicito que los encoders
+  // siguen activos durante el giro para telemetria/diagnostico.
+  (void)recorridoEncoder;
+
+  if (turnSign > 0) {
+    // Izquierda / antihorario
+    controlMotores(+pwm, -pwm);
+  } else {
+    // Derecha / horario
+    controlMotores(-pwm, +pwm);
+  }
+}
+
+// ============================================================
+// GOTO X,Y
+// ============================================================
+void irA(float xObjetivo, float yObjetivo) {
+  float dx = xObjetivo - posX;
+  float dy = yObjetivo - posY;
+
+  float distancia =
+    sqrt(dx * dx + dy * dy);
+
+  float headingObjetivo =
+    degrees(atan2(dy, dx));
+
+  float giroNecesario =
+    normalizeAngleDeg(
+      headingObjetivo - yawDeg
+    );
+
+  gotoTargetX = xObjetivo;
+  gotoTargetY = yObjetivo;
+  gotoDistanceMm = distancia;
+
+  enviarLinea(
+    "GOTO_ACCEPTED:" +
+    String(xObjetivo, 2) +
+    "," +
+    String(yObjetivo, 2)
+  );
+
+  if (distancia <= TOL_DIST_MM) {
+    posX = xObjetivo;
+    posY = yObjetivo;
+
+    enviarLinea("POINT_REACHED");
+    return;
+  }
+
+  if (abs(giroNecesario) > TOL_GIRO_DEG) {
+    comenzarGiro(
+      giroNecesario,
+      true
+    );
+  } else {
+    gotoPending = true;
+    comenzarAvance(distancia);
+  }
+}
+
+// ============================================================
+// TELEMETRIA
+// ============================================================
+void enviarTelemetria() {
+  if (
+    millis() - lastTelemetryMs <
+    TELEMETRIA_MS
+  ) {
+    return;
+  }
+
+  lastTelemetryMs = millis();
+
+  String msg =
+    "TEL,ENC1=" + String(countLeft) +
+    ",ENC2=" + String(countRight) +
+    ",DL=" + String(countsToMm(countLeft), 2) +
+    ",DR=" + String(countsToMm(countRight), 2) +
+    ",X=" + String(posX, 2) +
+    ",Y=" + String(posY, 2) +
+    ",YAW=" + String(yawDeg, 2) +
+    // NUEVO - yaw integrado del MPU6050
+    ",YAW_IMU=" + String(yawImuDeg, 2) +
+    ",E1=" + String(enc1Enabled ? 1 : 0) +
+    ",E2=" + String(enc2Enabled ? 1 : 0) +
+    ",M1=" + String(motor1Enabled ? 1 : 0) +
+    ",M2=" + String(motor2Enabled ? 1 : 0);
+
+  enviarLinea(msg);
+}
+
+// ============================================================
+// STOP / RESET
+// ============================================================
+void stopAGV() {
+  emergencyStop = true;
+  gotoPending = false;
+  estadoMovimiento = IDLE;
+
+  detenerMotores();
+
+  enviarLinea("STOPPED");
+}
+
+void resetOrigen() {
+  detenerMotores();
+
+  estadoMovimiento = IDLE;
+  emergencyStop = false;
+  gotoPending = false;
+
+  posX = 0.0f;
+  posY = 0.0f;
+  yawDeg = 0.0f;
+
+  // NUEVO - RESET DE REFERENCIA DE YAW DEL MPU6050
+  yawImuDeg = 0.0f;
+  yawImuInicioGiro = 0.0f;
+  lastImuMicros = micros();
+
+  resetEncoders();
+
+  enviarLinea("ACK:RESET");
+}
+
+// ============================================================
+// PROTOCOLO TCP
+// ============================================================
+void procesarComando(String cmd) {
+  cmd.trim();
+
+  if (cmd.length() == 0) return;
+
+  if (cmd == "PING") {
+    enviarLinea("ACK:PING");
+    return;
+  }
+
+  if (cmd == "START") {
+    emergencyStop = false;
+    enviarLinea("ACK:START");
+    return;
+  }
+
+  if (cmd == "STOP") {
+    stopAGV();
+    return;
+  }
+
+  if (cmd == "RESET") {
+    resetOrigen();
+    return;
+  }
+
+  if (cmd == "ENC1_ON") {
+    enc1Enabled = true;
+    enviarLinea("ACK:ENC1_ON");
+    return;
+  }
+
+  if (cmd == "ENC1_OFF") {
+    enc1Enabled = false;
+    enviarLinea("ACK:ENC1_OFF");
+    return;
+  }
+
+  if (cmd == "ENC2_ON") {
+    enc2Enabled = true;
+    enviarLinea("ACK:ENC2_ON");
+    return;
+  }
+
+  if (cmd == "ENC2_OFF") {
+    enc2Enabled = false;
+    enviarLinea("ACK:ENC2_OFF");
+    return;
+  }
+
+  if (cmd == "MOTOR1_ON") {
+    motor1Enabled = true;
+    enviarLinea("ACK:MOTOR1_ON");
+    return;
+  }
+
+  if (cmd == "MOTOR1_OFF") {
+    motor1Enabled = false;
+    detenerMotores();
+
+    enviarLinea("ACK:MOTOR1_OFF");
+    return;
+  }
+
+  if (cmd == "MOTOR2_ON") {
+    motor2Enabled = true;
+    enviarLinea("ACK:MOTOR2_ON");
+    return;
+  }
+
+  if (cmd == "MOTOR2_OFF") {
+    motor2Enabled = false;
+    detenerMotores();
+
+    enviarLinea("ACK:MOTOR2_OFF");
+    return;
+  }
+
+  if (cmd.startsWith("MOVE:")) {
+    if (estadoMovimiento != IDLE) {
+      enviarLinea("ERROR:BUSY");
+      return;
+    }
+
+    gotoPending = false;
+
+    enviarLinea("ACK:MOVE");
+
+    comenzarAvance(
+      cmd.substring(5).toFloat()
+    );
+
+    return;
+  }
+
+  if (cmd.startsWith("TURN:")) {
+    if (estadoMovimiento != IDLE) {
+      enviarLinea("ERROR:BUSY");
+      return;
+    }
+
+    gotoPending = false;
+
+    enviarLinea("ACK:TURN");
+
+    comenzarGiro(
+      cmd.substring(5).toFloat(),
+      false
+    );
+
+    return;
+  }
+
+  if (cmd.startsWith("GOTO:")) {
+    if (estadoMovimiento != IDLE) {
+      enviarLinea("ERROR:BUSY");
+      return;
+    }
+
+    String data = cmd.substring(5);
+
+    int commaIndex =
+      data.indexOf(',');
+
+    if (commaIndex < 0) {
+      enviarLinea("ERROR:BAD_GOTO");
+      return;
+    }
+
+    float x =
+      data.substring(
+        0,
+        commaIndex
+      ).toFloat();
+
+    float y =
+      data.substring(
+        commaIndex + 1
+      ).toFloat();
+
+    emergencyStop = false;
+
+    enviarLinea("ACK:GOTO");
+
+    irA(x, y);
+
+    return;
+  }
+
+  enviarLinea(
+    "ERROR:UNKNOWN_COMMAND:" + cmd
+  );
+}
+
+// ============================================================
+// WIFI
+// ============================================================
+void conectarWiFi() {
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    ssid,
+    password
+  );
+
+  Serial.print(
+    "Conectando a WiFi"
+  );
+
+  while (
+    WiFi.status() != WL_CONNECTED
+  ) {
+    delay(400);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi conectado");
+
+  Serial.print("IP ESP32: ");
+  Serial.println(WiFi.localIP());
+
+  server.begin();
+  server.setNoDelay(true);
+
+  Serial.print(
+    "Servidor TCP puerto "
+  );
+  Serial.println(TCP_PORT);
+}
+
+// ============================================================
+// OTA
+// ============================================================
+void configurarOTA() {
+  ArduinoOTA.setHostname(
+    OTA_HOSTNAME
+  );
+
+  // Si queres password:
+  // ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    otaEnProgreso = true;
+
+    emergencyStop = true;
+    gotoPending = false;
+    estadoMovimiento = IDLE;
+
+    detenerMotores();
+
+    Serial.println(
+      "OTA:START - motores detenidos"
+    );
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println();
+    Serial.println("OTA:END");
+  });
+
+  ArduinoOTA.onProgress([](
+    unsigned int progress,
+    unsigned int total
+  ) {
+    unsigned int percent =
+      (progress * 100U) / total;
+
+    Serial.printf(
+      "OTA:%u%%\r",
+      percent
+    );
+  });
+
+  ArduinoOTA.onError([](
+    ota_error_t error
+  ) {
+    Serial.printf(
+      "OTA ERROR[%u]\n",
+      error
+    );
+  });
+
+  ArduinoOTA.begin();
+
+  Serial.print(
+    "OTA listo. Host: "
+  );
+  Serial.println(
+    OTA_HOSTNAME
+  );
+}
+
+// ============================================================
+// CLIENTE TCP
+// ============================================================
+void mantenerCliente() {
+  if (!cliente || !cliente.connected()) {
+    WiFiClient nuevoCliente =
+      server.available();
+
+    if (nuevoCliente) {
+      if (cliente) {
+        cliente.stop();
+      }
+
+      cliente = nuevoCliente;
+      cliente.setNoDelay(true);
+
+      tcpBuffer = "";
+
+      enviarLinea("READY");
+      enviarLinea("ACK:TCP_CONNECTED");
+    }
+
+    return;
+  }
+
+  while (cliente.available()) {
+    char c = cliente.read();
+
+    if (c == '\n') {
+      procesarComando(
+        tcpBuffer
+      );
+
+      tcpBuffer = "";
+    }
+    else if (c != '\r') {
+      tcpBuffer += c;
+
+      if (
+        tcpBuffer.length() > 120
+      ) {
+        tcpBuffer = "";
+
+        enviarLinea(
+          "ERROR:TCP_BUFFER"
+        );
+      }
+    }
+  }
+}
+
+// ============================================================
+// ACTUALIZACION DE MOVIMIENTO
+// ============================================================
+void actualizarMovimiento() {
+  if (
+    emergencyStop ||
+    otaEnProgreso
+  ) {
+    detenerMotores();
+    return;
+  }
+
+  if (
+    estadoMovimiento ==
+    MOVING_STRAIGHT
+  ) {
+    actualizarAvance();
+  }
+  else if (
+    estadoMovimiento ==
+    TURNING
+  ) {
+    actualizarGiro();
+  }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+
+  detenerMotores();
+
+  Wire.begin(
+    SDA_PIN,
+    SCL_PIN
+  );
+
+  Wire.setClock(400000);
+
+  delay(200);
+
+  // ============================================================
+  // NUEVO - INICIALIZACION Y CALIBRACION DEL MPU6050
+  // IMPORTANTE: mantener el AGV quieto durante el arranque.
+  // ============================================================
+  if (iniciarMPU6050()) {
+    calibrarGyroZ();
+  } else {
+    imuOK = false;
+    Serial.println("ERROR: MPU6050 no encontrado en TCA canal 0");
+  }
+
+  resetEncoders();
+
+  conectarWiFi();
+
+  configurarOTA();
+
+  Serial.println("READY");
+}
+
+// ============================================================
+// LOOP
+// ============================================================
+void loop() {
+  mantenerCliente();
+
+  ArduinoOTA.handle();
+
+  leerEncoders();
+
+  // NUEVO - actualizar yaw del MPU6050 antes del control de movimiento
+  actualizarIMU();
+
+  actualizarMovimiento();
+
+  enviarTelemetria();
+
+  delay(2);
+}
