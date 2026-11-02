@@ -131,12 +131,19 @@ Este proyecto, [TraceBot] (PF, 2026 1er cuatrimestre) , resuelve la desconexión
 
 ### Alcance
 **Incluye:**
-- [X]
-- [Y]
+- Interfaz en PC conexión por Wifi con AGV
+- Sistema de marcado con tinta
+- Alimentación por baterias
+- Admite archivos .DXF
+- Cámara externa para localizar el AGV
+- Cámara en el AGV para realizar control de calidad
+- Superficie de trabajo máxima de 2 x 2 mts
+- Recalibración de cámara de calidad si es necesario
 
 **No incluye (por ahora):**
-- [A]
-- [B]
+- Localización y precisión de grado industrial
+- Capacidad de subir pendientes, circular sobre tierra, barro o superficies resbaladizas
+- Capacidad de operar en oscuridad o deslumbramiento 
 
 ### Estado del proyecto
 - **Madurez:** [idea / prototipo / MVP / validado]
@@ -146,9 +153,11 @@ Este proyecto, [TraceBot] (PF, 2026 1er cuatrimestre) , resuelve la desconexión
 ### Demo rápida
 - **Video / GIF:** [link o ruta en MULTIMEDIA]
 - **Instrucciones express (2 minutos):**
-  1) [Paso 1]
-  2) [Paso 2]
-  3) [Paso 3]
+  1) Abrir la Interfaz, colocar la IP de la ESP32 y conectar
+  2) Cargar el archivo .dxf del plano que se quiere dibujar
+  3) Cebar la bomba de tinta
+  4) Iniciar el recorrido. 
+  Opcional: se puede configurar las tolerancias de calidad y marcado
 
 ---
 
@@ -160,18 +169,19 @@ Este proyecto, [TraceBot] (PF, 2026 1er cuatrimestre) , resuelve la desconexión
 ## Arquitectura del sistema
 
 **Entradas (sensores / señales):**
-- [Sensor 1]
-- [Sensor 2]
+- Encoder AS5600
+- Giroscopio MPU6050
+- Apriltag
 
 **Procesamiento / Control:**
-- [Microcontrolador / PC / algoritmo / lógica]
+- ESP32, Notebook
 
 **Salidas (actuadores / señales):**
-- [Actuador 1]
-- [Actuador 2]
+- 2 Motoreductores 12V DC
+- Bomba peristaltica
 
 **Interfaz (si aplica):**
-- [Pantalla / dashboard / app / web]
+- Pantalla
 
 > (Opcional) Insertar diagrama:
 ![Diagrama de bloques](PLANOS/diagrama_bloques.png)
